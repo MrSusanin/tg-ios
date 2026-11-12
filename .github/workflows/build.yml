@@ -1,0 +1,149 @@
+name: Build IPA (stage 0 - plain Telegram)
+
+# Stage 0: собираем обычный Telegram-iOS без VPN, чтобы убедиться,
+# что сама сборка в GitHub Actions работает. VPN добавим на следующих этапах.
+#
+# Нужны два секрета репозитория (Settings -> Secrets and variables -> Actions):
+#   TG_API_ID    - api_id с my.telegram.org
+#   TG_API_HASH  - api_hash с my.telegram.org
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_ref:
+        description: "Ветка или тег TelegramMessenger/Telegram-iOS"
+        default: "master"
+      runner:
+        description: "Метка раннера (macos-15, macos-14, ...)"
+        default: "macos-15"
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Check secrets
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Добавьте секреты TG_API_ID и TG_API_HASH (Settings -> Secrets and variables -> Actions)"
+            exit 1
+          fi
+
+      - name: Free disk space
+        run: |
+          df -h /
+          xcrun simctl delete all 2>/dev/null || true
+          xcrun simctl runtime delete all 2>/dev/null || true
+          sudo rm -rf /Users/runner/Library/Android 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches 2>/dev/null || true
+          df -h /
+
+      - name: Clone Telegram-iOS
+        env:
+          TG_REF: ${{ inputs.telegram_ref }}
+        run: |
+          git clone --recursive -j8 --branch "$TG_REF" \
+            https://github.com/TelegramMessenger/Telegram-iOS.git "$HOME/telegram-ios"
+
+      - name: Select Xcode
+        id: xcode
+        run: |
+          cd "$HOME/telegram-ios"
+          cat versions.json
+          WANT=$(python3 -c "import json; print(json.load(open('versions.json'))['xcode'])")
+          echo "Нужен Xcode: $WANT"
+          ls -d /Applications/Xcode*.app || true
+
+          CHOSEN=""
+          OVERRIDE=""
+          for CAND in "/Applications/Xcode_${WANT}.app" "/Applications/Xcode_${WANT%.*}.app"; do
+            if [ -d "$CAND" ]; then CHOSEN="$CAND"; break; fi
+          done
+          if [ -z "$CHOSEN" ]; then
+            CHOSEN=$(python3 - <<'PY'
+          import glob, re
+          apps = glob.glob('/Applications/Xcode_*.app')
+          key = lambda p: [int(x) for x in re.findall(r'\d+', p)]
+          print(sorted(apps, key=key)[-1])
+          PY
+            )
+            OVERRIDE="--overrideXcodeVersion"
+            echo "::warning::Xcode $WANT не найден, использую $CHOSEN с флагом override"
+          fi
+          sudo xcode-select -s "$CHOSEN/Contents/Developer"
+          xcodebuild -version
+          echo "override=$OVERRIDE" >> "$GITHUB_OUTPUT"
+
+      - name: Make configuration
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          cd "$HOME/telegram-ios"
+          python3 - <<'PY'
+          import json, os
+          cfg = json.load(open('build-system/appstore-configuration.json'))
+          cfg['api_id'] = os.environ['TG_API_ID']
+          cfg['api_hash'] = os.environ['TG_API_HASH']
+          json.dump(cfg, open('build-system/my-configuration.json', 'w'), indent=2)
+          PY
+          echo "Конфигурация создана (содержимое не выводим)"
+
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: Build
+        timeout-minutes: 300
+        run: |
+          cd "$HOME/telegram-ios"
+          python3 -u build-system/Make/Make.py \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            ${{ steps.xcode.outputs.override }} \
+            build \
+            --configurationPath=build-system/my-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber=100001 \
+            --configuration=release_arm64
+
+      - name: Save Bazel cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Package IPA (remove app extensions)
+        run: |
+          cd "$HOME/telegram-ios"
+          IPA=$(find build -name '*.ipa' | head -1)
+          if [ -z "$IPA" ]; then
+            echo "::error::.ipa не найден"
+            exit 1
+          fi
+          echo "Найден: $IPA"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$IPA" "$GITHUB_WORKSPACE/out/Telegram-full.ipa"
+
+          WORK=$(mktemp -d)
+          cd "$WORK"
+          unzip -q "$IPA"
+          APP=$(ls -d Payload/*.app | head -1)
+          rm -rf "$APP/PlugIns" "$APP/Watch"
+          zip -qry "$GITHUB_WORKSPACE/out/Telegram-noext.ipa" .
+          ls -lh "$GITHUB_WORKSPACE/out"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-ipa
+          path: out/*.ipa
+          retention-days: 14
+          if-no-files-found: error
