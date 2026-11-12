@@ -35,9 +35,8 @@ jobs:
       - name: Free disk space
         run: |
           df -h /
-          xcrun simctl delete all 2>/dev/null || true
+          # Simulator devices and runtimes are needed for asset compilation.
           sudo rm -rf /Users/runner/Library/Android 2>/dev/null || true
-          sudo rm -rf /Library/Developer/CoreSimulator/Caches 2>/dev/null || true
           df -h /
 
       - name: Clone Telegram-iOS
@@ -90,6 +89,47 @@ jobs:
           json.dump(cfg, open('build-system/my-configuration.json', 'w'), indent=2)
           PY
           echo "Конфигурация создана (содержимое не выводим)"
+
+      - name: Renew expired fake provisioning profiles
+        run: |
+          cd "$HOME/telegram-ios"
+          python3 - <<'PY'
+          import glob
+          import re
+          import sys
+
+          pattern = re.compile(
+              rb'(<key>ExpirationDate</key>\s*<date>)'
+              rb'(\d{4})(-\d\d-\d\dT\d\d:\d\d:\d\dZ</date>)'
+          )
+          files = glob.glob(
+              'build-system/fake-codesigning/**/*.mobileprovision',
+              recursive=True,
+          )
+          if not files:
+              print('::error::No fake provisioning profiles found')
+              sys.exit(1)
+
+          broadcast_profile = 'build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision'
+          changed_paths = []
+          for path in files:
+              with open(path, 'rb') as profile:
+                  data = profile.read()
+              updated, count = pattern.subn(
+                  lambda match: match.group(1) + b'2099' + match.group(3),
+                  data,
+              )
+              if count:
+                  with open(path, 'wb') as profile:
+                      profile.write(updated)
+                  changed_paths.append(path)
+                  print(f'Updated expiration date in {path}')
+
+          if broadcast_profile not in changed_paths:
+              print(f'::error::Could not update expiration date in {broadcast_profile}')
+              sys.exit(1)
+          print(f'Updated {len(changed_paths)} of {len(files)} fake provisioning profiles')
+          PY
 
       - name: Restore Bazel cache
         uses: actions/cache/restore@v4
