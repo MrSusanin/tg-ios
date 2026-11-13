@@ -14,8 +14,8 @@ on:
         description: "Ветка или тег TelegramMessenger/Telegram-iOS"
         default: "master"
       runner:
-        description: "Метка раннера (macos-15, macos-14, ...)"
-        default: "macos-15"
+        description: "Метка раннера: xcode-27 (Xcode 27, macOS 27) или macos-15 (запасной вариант)"
+        default: "xcode-27"
 
 jobs:
   build:
@@ -35,7 +35,7 @@ jobs:
       - name: Free disk space
         run: |
           df -h /
-          # Simulator devices and runtimes are needed for asset compilation.
+          # Симуляторы и их runtimes НЕ трогаем: без них не компилируются ассеты
           sudo rm -rf /Users/runner/Library/Android 2>/dev/null || true
           df -h /
 
@@ -57,19 +57,19 @@ jobs:
 
           CHOSEN=""
           OVERRIDE=""
-          for CAND in "/Applications/Xcode_${WANT}.app" "/Applications/Xcode_${WANT%.*}.app"; do
+          for CAND in "/Applications/Xcode_${WANT}.app" "/Applications/Xcode_${WANT}.0.app" "/Applications/Xcode_${WANT%.*}.app"; do
             if [ -d "$CAND" ]; then CHOSEN="$CAND"; break; fi
           done
           if [ -z "$CHOSEN" ]; then
             CHOSEN=$(python3 - <<'PY'
           import glob, re
-          apps = glob.glob('/Applications/Xcode_*.app')
+          apps = glob.glob('/Applications/Xcode_*.app') or glob.glob('/Applications/Xcode*.app')
           key = lambda p: [int(x) for x in re.findall(r'\d+', p)]
           print(sorted(apps, key=key)[-1])
           PY
             )
             OVERRIDE="--overrideXcodeVersion"
-            echo "::warning::Xcode $WANT не найден, использую $CHOSEN с флагом override"
+            echo "::warning::Xcode $WANT не найден, использую $CHOSEN с флагом override (сборка может упасть из-за версии SDK)"
           fi
           sudo xcode-select -s "$CHOSEN/Contents/Developer"
           xcodebuild -version
@@ -93,55 +93,67 @@ jobs:
       - name: Renew expired fake provisioning profiles
         run: |
           cd "$HOME/telegram-ios"
+          openssl version
+          # Профили подписаны (CMS). Простая правка байтов ломает подпись, и Make.py
+          # падает на проверке openssl. Поэтому: читаем профиль, меняем срок,
+          # подписываем заново временным самоподписанным ключом и проверяем
+          # той же командой, что использует Make.py.
           python3 - <<'PY'
-          import glob
-          import re
-          import sys
+          import glob, os, re, subprocess, sys, tempfile
 
-          pattern = re.compile(
-              rb'(<key>ExpirationDate</key>\s*<date>)'
-              rb'(\d{4})(-\d\d-\d\dT\d\d:\d\d:\d\dZ</date>)'
-          )
-          files = glob.glob(
-              'build-system/fake-codesigning/**/*.mobileprovision',
-              recursive=True,
-          )
+          PAT = re.compile(rb'(<key>ExpirationDate</key>\s*<date>)(\d{4})(-\d\d-\d\dT\d\d:\d\d:\d\dZ</date>)')
+          VERIFY = ['openssl', 'smime', '-inform', 'der', '-verify', '-noverify', '-in']
+
+          files = sorted(glob.glob('build-system/fake-codesigning/**/*.mobileprovision', recursive=True))
           if not files:
-              print('::error::No fake provisioning profiles found')
+              print('::error::fake provisioning profiles not found')
               sys.exit(1)
 
-          broadcast_profile = 'build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision'
-          changed_paths = []
+          work = tempfile.mkdtemp()
+          key = os.path.join(work, 'k.pem')
+          crt = os.path.join(work, 'c.pem')
+          subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                          '-keyout', key, '-out', crt, '-days', '3650',
+                          '-subj', '/CN=fake-profile-signer'],
+                         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
           for path in files:
-              with open(path, 'rb') as profile:
-                  data = profile.read()
-              updated, count = pattern.subn(
-                  lambda match: match.group(1) + b'2099' + match.group(3),
-                  data,
-              )
-              if count:
-                  with open(path, 'wb') as profile:
-                      profile.write(updated)
-                  changed_paths.append(path)
-                  print(f'Updated expiration date in {path}')
-
-          if broadcast_profile not in changed_paths:
-              print(f'::error::Could not update expiration date in {broadcast_profile}')
-              sys.exit(1)
-          print(f'Updated {len(changed_paths)} of {len(files)} fake provisioning profiles')
+              r = subprocess.run(VERIFY + [path], capture_output=True)
+              if r.returncode != 0:
+                  print('::error::cannot read original profile', path, r.stderr.decode(errors='replace'))
+                  sys.exit(1)
+              plain, n = PAT.subn(lambda m: m.group(1) + b'2099' + m.group(3), r.stdout)
+              if n != 1:
+                  print('::error::ExpirationDate not found exactly once in', path, '- found', n)
+                  sys.exit(1)
+              plain_path = os.path.join(work, 'plain.plist')
+              with open(plain_path, 'wb') as f:
+                  f.write(plain)
+              subprocess.run(['openssl', 'smime', '-sign', '-binary', '-nodetach',
+                              '-signer', crt, '-inkey', key, '-outform', 'der',
+                              '-in', plain_path, '-out', path], check=True)
+              chk = subprocess.run(VERIFY + [path], capture_output=True)
+              if chk.returncode != 0 or b'2099' not in chk.stdout:
+                  print('::error::re-signed profile does not verify:', path,
+                        chk.stderr.decode(errors='replace'))
+                  sys.exit(1)
+              print('OK', path)
+          print('Re-signed and verified', len(files), 'profiles')
           PY
 
       - name: Restore Bazel cache
         uses: actions/cache/restore@v4
         with:
           path: ~/telegram-bazel-cache
-          key: bazel-${{ runner.os }}-${{ github.run_id }}
+          key: bazel-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             bazel-${{ runner.os }}-
 
       - name: Build
         timeout-minutes: 300
+        shell: bash
         run: |
+          set -o pipefail
           cd "$HOME/telegram-ios"
           python3 -u build-system/Make/Make.py \
             --cacheDir="$HOME/telegram-bazel-cache" \
@@ -150,14 +162,27 @@ jobs:
             --configurationPath=build-system/my-configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --buildNumber=100001 \
-            --configuration=release_arm64
+            --configuration=release_arm64 2>&1 | tee "$HOME/build.log"
+
+      - name: Show first errors
+        if: failure()
+        run: |
+          if [ -f "$HOME/build.log" ]; then
+            echo "=== Первые строки с ERROR (с контекстом) ==="
+            grep -n -m3 -B3 -A25 'ERROR:' "$HOME/build.log" || echo "строк ERROR: не найдено"
+            echo
+            echo "=== Последние 40 строк лога ==="
+            tail -n 40 "$HOME/build.log"
+          else
+            echo "build.log не создан: сборка не дошла до запуска"
+          fi
 
       - name: Save Bazel cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ~/telegram-bazel-cache
-          key: bazel-${{ runner.os }}-${{ github.run_id }}
+          key: bazel-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Package IPA (remove app extensions)
         run: |
